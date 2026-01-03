@@ -1,15 +1,22 @@
 #!/bin/bash
-# Install Ubuntu 22.04 or later to ZFS root - Boot from either Live media or netboot and run
+# Install Ubuntu 22.04 or later to ZFS root - Boot from Live media or netboot and run this script
 # Ref: https://openzfs.github.io/openzfs-docs/Getting%20Started/Ubuntu/Ubuntu%2022.04%20Root%20on%20ZFS.html
 
-# Installation parameters
-ROOT_DISK=/dev/vda              # All data on this disk will be destroyed
-NEW_HOSTNAME=ubuzfs             # The hostname to be assigned to the new system
-HIBERNATION=Y                   # Enable hibernation (requires a traditional swap partition outside of ZFS) Y/N
-SWAP_SIZE=0                     # Swap size in GB.  Swap will use a ZFS volume unless HIBERNATION=Y
+# Installation parameters       # All data on ROOT_DISK will be destroyed
+if [[ -b /dev/vda ]]; then
+    ROOT_DISK=/dev/vda          # If a virtual disk is present it has priority
+elif [[ -b /dev/nvme0n1 ]]; then
+    ROOT_DISK=/dev/nvme0n1      # The first NVMe device
+elif [[ -b /dev/sda ]]; then
+    ROOT_DISK=/dev/sda          # The first SATA/SAS device
+fi
+NEW_HOSTNAME="ubuzfs"           # The hostname to be assigned to the new system
+HIBERNATION=N                   # Enable hibernation (requires a traditional swap partition outside of ZFS) Y/N
+SWAP_SIZE=8                     # Swap size in GB.  Swap will use a ZFS volume unless HIBERNATION=Y
 ROOT_PASSWD=password            # Initial password for the new root user
+ROOT_SSH_KEYS=""                # An SSH key to be staged in authorized_keys of the root user
 NEW_LOCALE="en_US.UTF-8"        # Set the locale
-NEW_TIMEZONE="US/Central"       # Set the timezone
+NEW_TIMEZONE="America/Chicago"  # Set the timezone
 REBOOT=Y                        # Reboot automatically after completion (Y/N)
 
 
@@ -18,7 +25,8 @@ VERSION_CODENAME="noble"
 DPKG_ARCH="amd64"
 INCLUDE_PACKAGES="ubuntu-minimal,openssh-server,wget"
 EXCLUDE_PACKAGES="ubuntu-pro-client"
-APT_MIRROR=""
+APT_MIRROR=""                   # URL to Install from local mirror if defined
+APT_REPOS=(${VERSION_CODENAME} ${VERSION_CODENAME}-security ${VERSION_CODENAME}-updates)
 
 
 # Re-run with sudo if not running as root
@@ -108,9 +116,9 @@ else
   # Create an ESP or bios_boot partition as needed
   if [[ -d /sys/firmware/efi ]]
     then
-    # EFI boot starts at 1M offset and 100M size
+    # EFI boot starts at 1M offset and 1G size
     printf "Creating the EFI system partition...\n"
-    sgdisk -n ${EFI_PART}:1M:+100M -t ${EFI_PART}:EF00 "${ROOT_DISK}" &>/dev/null || fail "Failed to create EFI system partition."
+    sgdisk -n ${EFI_PART}:1M:+1G -t ${EFI_PART}:EF00 "${ROOT_DISK}" &>/dev/null || fail "Failed to create EFI system partition."
   else
     # BIOS boot partition on blocks 34-2047
     printf "Creating the bios_boot partition for the GPT labeled disk...\n"
@@ -152,9 +160,9 @@ fi
 # Filesystem layout separates user data from the OS
 printf "Creating additional ZFS datasets...\n"
 zfs create -o canmount=off -o mountpoint=none rpool/ROOT
-zfs create -o mountpoint=/ -o com.ubuntu.zsys:bootfs=yes -o com.ubuntu.zsys:last-used=$(date +%s) rpool/ROOT/ubuntu
+zfs create -o mountpoint=/ rpool/ROOT/ubuntu
 # The 'var' dataset is only used as a container for other datasets and is not mounted as file system itself
-zfs create -o com.ubuntu.zsys:bootfs=no -o canmount=off -o setuid=off -o exec=off -o devices=off rpool/ROOT/ubuntu/var
+zfs create -o canmount=off -o setuid=off -o exec=off -o devices=off rpool/ROOT/ubuntu/var
 zfs create -o exec=on rpool/ROOT/ubuntu/var/lib
 zfs create rpool/ROOT/ubuntu/var/log
 zfs create rpool/ROOT/ubuntu/var/spool
@@ -162,8 +170,8 @@ zfs create rpool/ROOT/ubuntu/var/mail
 zfs create -o com.sun:auto-snapshot=false rpool/ROOT/ubuntu/var/cache
 zfs create -o com.sun:auto-snapshot=false -o mountpoint=/var/lib/nfs rpool/ROOT/ubuntu/var/nfs
 zfs create -o com.sun:auto-snapshot=false -o exec=on rpool/ROOT/ubuntu/var/tmp
-zfs create -o com.sun:auto-snapshot=false -o com.ubuntu.zsys:bootfs=no -o exec=on rpool/ROOT/ubuntu/tmp
-zfs create -o com.ubuntu.zsys:bootfs-datasets=rpool/ROOT/ubuntu -o setuid=off -o devices=off -o mountpoint=/home rpool/home
+zfs create -o com.sun:auto-snapshot=false -o exec=on rpool/ROOT/ubuntu/tmp
+zfs create -o setuid=off -o devices=off -o mountpoint=/home rpool/home
 zfs create -o mountpoint=/root rpool/home/root
 if [[ ${HIBERNATION^^} != Y && $SWAP_SIZE -gt 0 ]]
   then
@@ -171,7 +179,6 @@ if [[ ${HIBERNATION^^} != Y && $SWAP_SIZE -gt 0 ]]
   zfs create -V ${SWAP_SIZE}G -o compression=zle \
     -o logbias=throughput -o sync=always \
     -o primarycache=metadata -o secondarycache=none \
-    -o com.ubuntu.zsys:bootfs-datasets=rpool/ROOT/ubuntu \
     -o com.sun:auto-snapshot=false rpool/swap
 fi
 
@@ -192,7 +199,7 @@ debootstrap \
  --arch="${DPKG_ARCH}" \
  --include="${INCLUDE_PACKAGES}" \
  --exclude="${EXCLUDE_PACKAGES}" \
- "${VERSION_CODENAME}" /mnt "${MIRROR}" \
+ "${VERSION_CODENAME}" /mnt "${APT_MIRROR}" \
   || fail "Installation failed running debootstrap"
 
 printf "Performing system configuration...\n"
@@ -200,14 +207,34 @@ printf "Performing system configuration...\n"
 printf %b "root:${ROOT_PASSWD}" | sudo chroot /mnt chpasswd || fail "Failed to set the root password."
 printf "${NEW_HOSTNAME}\n" >/mnt/etc/hostname || fail "Failed to set the system hostname."
 
-# Configure package sources
-cat << EOF >/mnt/etc/apt/sources.list || fail "Failed to setup apt sources.list"
+# Configure SSH
+if [[ -n "${ROOT_SSH_KEYS}" ]]; then
+  printf "Staging SSH keys for the root user...\n"
+  mkdir -m 0700 /mnt/root/.ssh
+  echo "${ROOT_SSH_KEYS}" >/mnt/root/.ssh/authorized_keys
+  chmod 0600 /mnt/root/.ssh/authorized_keys
+else
+  printf "   Enabling root SSH login with password...\n"
+  sed -i 's/^#PermitRootLogin .*/PermitRootLogin Yes/g' /mnt/etc/ssh/sshd_config &>/dev/null
+fi
+
+# Configure local package sources if "APT_MIRROR" was defined
+if [[ -n "${APT_MIRROR}" ]]; then
+    printf "# Generated by zfs-installer\n" >/mnt/etc/apt/sources.list
+    for REPO in ${APT_REPOS[@]}; do
+        printf "deb ${APT_MIRROR} ${REPO} main\n" >>/mnt/etc/apt/sources.list
+    done
+    printf "\n# deb https://archive.ubuntu.com/ubuntu ${VERSION_CODENAME} main restricted universe\n" >>/mnt/etc/apt/sources.list
+else
+    # Use public Ubuntu repositories when no "APT_MIRROR" defined
+    cat << EOF >/mnt/etc/apt/sources.list || fail "Failed to setup apt sources.list"
 # Generated by zfs-installer
-deb https://archive.ubuntu.com/ubuntu ${VERSION_CODENAME} main restricted universe multiverse
-deb https://archive.ubuntu.com/ubuntu ${VERSION_CODENAME}-updates main restricted universe multiverse
-deb https://archive.ubuntu.com/ubuntu ${VERSION_CODENAME}-backports main restricted universe multiverse
-deb https://security.ubuntu.com/ubuntu ${VERSION_CODENAME}-security main restricted universe multiverse
+deb https://archive.ubuntu.com/ubuntu ${VERSION_CODENAME} main restricted universe
+deb https://archive.ubuntu.com/ubuntu ${VERSION_CODENAME}-updates main restricted universe
+deb https://archive.ubuntu.com/ubuntu ${VERSION_CODENAME}-backports main restricted universe
+deb https://security.ubuntu.com/ubuntu ${VERSION_CODENAME}-security main restricted universe
 EOF
+fi
 
 # Configuring network plan for the new system to use DHCP on all ethernet interfaces
 cat << EOF >/mnt/etc/netplan/01-networkd-dhcp-all.yaml || fail "Failed to define the default network plan."
@@ -238,8 +265,8 @@ if [[ -b $BPOOL_DEV ]]
     -O canmount=off \
     -O mountpoint=none \
     -R /mnt bpool ${BPOOL_DEV} || fail "Failed to create ZFS bpool on ${BPOOL_DEV}."
+  zfs create -o mountpoint=/boot -o canmount=on bpool/boot
 fi
-zfs create -o mountpoint=/boot bpool/boot
 
 # Set up the swap partition or ZFS volume per user input
 if [[ -b /dev/zvol/rpool/swap ]]
@@ -254,16 +281,18 @@ elif [[ -b ${SWAP_DEV} ]]
   printf "/dev/disk/by-label/SWAP none swap defaults 0 0\n" >> /mnt/etc/fstab
 fi
 
-
 CHROOT_SCRIPT='/mnt/zfs-init'
 ##### BEGIN CHROOT SCRIPT #################################
 cat << EOF > ${CHROOT_SCRIPT} || fail "Failed to write the helper script in the new ZFS root."
+#!/bin/bash
+# chroot script to configure newly install debootstrap
+
 function fail() {
   printf %b "${1}\n"
   exit 1
 }
 
-printf "Setting locale to en_US.UTF-8 and timezone to US/Central...\n"
+printf "Setting locale to ${NEW_LOCALE} and timezone to ${NEW_TIMEZONE}...\n"
 locale-gen --purge "${NEW_LOCALE}" &>/dev/null || fail "Failed running locale-gen"
 update-locale LANG="${NEW_LOCALE}" &>/dev/null || fail "Failed running update-locale"
 printf "${NEW_TIMEZONE}" > "/etc/timezone" || fail "Failed to update /etc/timezone"
@@ -272,9 +301,6 @@ dpkg-reconfigure --frontend noninteractive tzdata &>/dev/null || fail "Failed se
 printf "Updating apt sources in the new installation...\n"
 apt-get clean
 apt-get update -qq &>/dev/null || fail "Failed updating apt cache."
- 
-printf "   Enable SSH root login with password...\n"
-sed -i 's/^#PermitRootLogin .*/PermitRootLogin Yes/g' /etc/ssh/sshd_config &>/dev/null
 
 printf "   linux-image-generic...\n"
 apt-get -qq install --yes --no-install-recommends linux-image-generic &>/dev/null || fail "Failed to install linux-image-generic"
@@ -284,9 +310,6 @@ apt-get -qq install --yes zfsutils-linux &>/dev/null || fail "Failed to install 
 
 printf "   zfs-initramfs...\n"
 apt-get -qq install --yes zfs-initramfs &>/dev/null || fail "Failed to install zfs-initramfs"
-
-printf "   zsys...\n"
-apt-get -qq install --yes zsys &>/dev/null || fail "Failed to install zsys"
 
 function configure_grub() {
   printf "   initramfs-tools grub-pc...\n"
@@ -305,6 +328,19 @@ function configure_grub() {
 }
 
 # Configure grub for either EFI or BIOS
+# These steps establish correct mount order for bpool and the EFI partition
+mkdir /etc/zfs/zfs-list.cache
+touch /etc/zfs/zfs-list.cache/rpool
+zed -F &
+zpool set cachefile=/etc/zfs/zpool.cache rpool
+if zpool list bpool &>/dev/null; then
+  touch /etc/zfs/zfs-list.cache/bpool
+  zpool set cachefile=/etc/zfs/zpool.cache bpool
+fi
+sleep 3
+pkill zed
+/usr/lib/systemd/system-generators/zfs-mount-generator
+sed -Ei "s|/mnt/?|/|" /etc/zfs/zfs-list.cache/*
 if [[ -d /sys/firmware/efi ]]; then
   printf "   dosfstools...\n"
   apt-get -qq install --yes dosfstools &>/dev/null
@@ -316,19 +352,6 @@ if [[ -d /sys/firmware/efi ]]; then
   configure_grub
   printf "Running grub-install...\n"
   grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck --no-floppy || fail "grub-install failed!"
-
-  # These steps establish correct mount order for bpool and the EFI partition
-  mkdir /etc/zfs/zfs-list.cache
-  touch /etc/zfs/zfs-list.cache/{bpool,rpool}
-  zed -F &
-  zfs set canmount=on bpool/boot
-  zfs set canmount=on rpool/ROOT/ubuntu
-  zpool set cachefile=/etc/zfs/zpool.cache rpool
-  zpool set cachefile=/etc/zfs/zpool.cache bpool
-  sleep 3
-  pkill zed
-  /usr/lib/systemd/system-generators/zfs-mount-generator
-  sed -Ei "s|/mnt/?|/|" /etc/zfs/zfs-list.cache/*
 else
   configure_grub
   printf "Running grub-install...\n"
