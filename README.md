@@ -5,6 +5,7 @@
 1. [initramfs](#initramfs)
 1. [rootfs](#rootfs)
 1. [iPXE Example](#ipxe)
+1. [mirror](#mirror)
 
 ### TL:DR
 
@@ -169,4 +170,47 @@ goto start
 ```
 
 If you use syslinux instead of ipxe, change your settings accordingly.
+
+### mirror
+
+If you want redundancy for the boot disk and root filesystem, these procedures can be used to clone
+partitions between identical disks and mirror the data and boot partitions:
+
+1) Install the needed packages:
+```
+apt-get install -y gdisk parted
+```
+
+2) Identify the disks and partitions currently in use by the system.  Helpful commands for this include
+"mount", "zpool status", "lsblk", "ls -l /dev/disk/by-id", and "cat /etc/fstab"
+
+3) Clone the disk partitions from the root disk to a second disk.
+```
+# ---- PAY ATTENTION TO THE SOURCE AND TARGET DISK ORDER ---
+sgdisk -R <target_disk> <source_disk>     # Copy the partition table from source to target
+sgdisk -G <target_disk>                   # Generate new GUIDs for the new disk partitions
+partprobe                                 # Refresh partition table
+```
+
+4) Attach the new disk partitions to the root and boot ZFS pools.  The source devices will be from the
+existing "zpool status" output.  It's recommended to use devices from /dev/disk/by-id/<device-partition>
+```
+zpool attach rpool <source> <target>      # Attach mirror to the root zpool
+zpool attach bpool <source> <target>      # Attach mirror to the boot zpool
+```
+
+5) Identify the EFI partition on the new mirror disk and create a FAT32 file system.  Update "/etc/fstab"
+to mount the disk label "EFI2" at "/boot/efi-mirror".  Re-load systemd after updating fstab and then mount
+the EFI mirror:
+```
+mkdosfs -F 32 -s 1 -n EFI2 /dev/nvme1n1p1
+<edit /etc/fstab" with your preferred editor>
+systemctl daemon-reload
+mount -a
+```
+
+6) Update grub so it will use both disks.  All disks with the EFS GPT type will be managed by grub.
+```
+dpkg-reconfigure grub-efi-amd64-signed
+```
 
